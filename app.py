@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Photo Frame Identification System
-Hosted version: Dropbox photo sync + face recognition + mobile-ready UI.
+Photos are NEVER stored locally — only face encodings (~5 MB) are cached.
+The face index is persisted back to Dropbox so it survives Railway redeploys.
 """
 
 import os
@@ -14,28 +15,28 @@ import time
 import threading
 from functools import wraps
 from pathlib import Path
-from flask import (Flask, request, jsonify, send_file,
+from flask import (Flask, request, jsonify, send_file, Response,
                    render_template_string, session, redirect, url_for)
 
 app = Flask(__name__)
 
-# ── Config (set via environment variables on Railway) ────────────────────────
-BASE_DIR       = Path(__file__).parent
-PHOTOS_DIR     = BASE_DIR / 'photos'          # local cache synced from Dropbox (Railway Volume)
-ENCODINGS_FILE = PHOTOS_DIR / 'face_index.pkl'  # stored on the volume — survives redeploys
+# ── Config ────────────────────────────────────────────────────────────────────
+BASE_DIR          = Path(__file__).parent
+ENCODINGS_FILE    = BASE_DIR / 'face_index.pkl'
+MANIFEST_FILE     = BASE_DIR / 'dropbox_manifest.json'
 SYNC_STATUS_FILE  = BASE_DIR / 'sync_status.json'
 INDEX_STATUS_FILE = BASE_DIR / 'index_status.json'
-IMG_EXTS       = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp', '.heic'}
+IMG_EXTS          = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp', '.heic'}
 
 DROPBOX_TOKEN  = os.environ.get('DROPBOX_TOKEN', '')
 DROPBOX_FOLDER = os.environ.get('DROPBOX_FOLDER', '/Student Photos')
-APP_PASSWORD   = os.environ.get('APP_PASSWORD', '')   # blank = no password required
+APP_PASSWORD   = os.environ.get('APP_PASSWORD', '')
 
-# Secret key: signs sessions + photo URL tokens.
 _SECRET = os.environ.get('SECRET_KEY', os.urandom(32).hex())
 app.secret_key = _SECRET
 
-PHOTOS_DIR.mkdir(exist_ok=True)
+# The face index is stored back to Dropbox so it persists across redeploys
+DROPBOX_INDEX_PATH = DROPBOX_FOLDER.rstrip('/') + '/.face_index.pkl'
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
@@ -48,57 +49,49 @@ def login_required(f):
     return decorated
 
 
-def sign_photo_url(rel_path: str) -> str:
+def sign_photo_url(dropbox_path: str) -> str:
     expiry  = int(time.time()) + 3600
-    message = f"{rel_path}:{expiry}".encode()
+    message = f"{dropbox_path}:{expiry}".encode()
     sig     = hmac.new(_SECRET.encode(), message, hashlib.sha256).hexdigest()
     return f"{expiry}:{sig}"
 
 
-def verify_photo_token(rel_path: str, token: str) -> bool:
+def verify_photo_token(dropbox_path: str, token: str) -> bool:
     try:
         expiry_str, sig = token.split(':', 1)
         expiry = int(expiry_str)
         if time.time() > expiry:
             return False
-        message  = f"{rel_path}:{expiry}".encode()
+        message  = f"{dropbox_path}:{expiry}".encode()
         expected = hmac.new(_SECRET.encode(), message, hashlib.sha256).hexdigest()
         return hmac.compare_digest(sig, expected)
     except Exception:
         return False
 
-# ── Lazy imports ─────────────────────────────────────────────────────────────
+# ── Lazy imports ──────────────────────────────────────────────────────────────
 
 _fr_error = None
 
 def _patch_pkg_resources():
-    """
-    Python 3.12 venvs don't include pkg_resources by default.
-    face_recognition_models uses it to locate model files.
-    We inject a minimal shim so the import succeeds.
-    """
     try:
         import pkg_resources
         return
     except ImportError:
         pass
     import sys, os, types, importlib.util
-
     pkg = types.ModuleType('pkg_resources')
-
     def resource_filename(package_or_req, resource_name):
         name = package_or_req if isinstance(package_or_req, str) else package_or_req.__name__
         spec = importlib.util.find_spec(name)
         if spec and spec.origin:
             return os.path.join(os.path.dirname(spec.origin), resource_name)
         return resource_name
-
     pkg.resource_filename = resource_filename
     sys.modules['pkg_resources'] = pkg
     print("[startup] pkg_resources shim installed", flush=True)
 
 
-_patch_pkg_resources()   # run once at startup
+_patch_pkg_resources()
 
 
 def require_fr():
@@ -112,6 +105,7 @@ def require_fr():
         print(f"[face_recognition import error] {_fr_error}", flush=True)
         return None, None
 
+
 def require_dbx():
     if not DROPBOX_TOKEN:
         return None, 'DROPBOX_TOKEN environment variable not set.'
@@ -119,8 +113,43 @@ def require_dbx():
         import dropbox
         return dropbox.Dropbox(DROPBOX_TOKEN), None
     except ImportError:
-        return None, 'dropbox package not installed — run: pip install dropbox'
+        return None, 'dropbox package not installed.'
 
+# ── Index persistence via Dropbox ─────────────────────────────────────────────
+
+def _load_index_from_dropbox():
+    """On startup, download the face index from Dropbox if it exists."""
+    if ENCODINGS_FILE.exists():
+        return
+    dbx, err = require_dbx()
+    if err:
+        return
+    try:
+        _, response = dbx.files_download(DROPBOX_INDEX_PATH)
+        ENCODINGS_FILE.write_bytes(response.content)
+        count = len(pickle.loads(response.content))
+        print(f"[startup] Loaded face index from Dropbox ({count} entries)", flush=True)
+    except Exception as e:
+        print(f"[startup] No cached index in Dropbox (will need to build): {e}", flush=True)
+
+
+def _save_index_to_dropbox(data: list):
+    """Save the face index to Dropbox so it survives redeploys."""
+    dbx, err = require_dbx()
+    if err:
+        return
+    try:
+        import dropbox as dbx_module
+        raw = pickle.dumps(data)
+        dbx.files_upload(raw, DROPBOX_INDEX_PATH,
+                         mode=dbx_module.files.WriteMode.overwrite)
+        print(f"[index] Saved {len(data)} encodings to Dropbox", flush=True)
+    except Exception as e:
+        print(f"[index] Failed to save index to Dropbox: {e}", flush=True)
+
+
+# Run on startup — restores index from Dropbox after a redeploy
+_load_index_from_dropbox()
 
 # ── Background task helpers ───────────────────────────────────────────────────
 
@@ -145,11 +174,10 @@ def _read_status(path: Path) -> dict:
             pass
     return {'state': 'idle'}
 
-
-# ── Dropbox sync ──────────────────────────────────────────────────────────────
+# ── Dropbox sync (list only — no downloads) ───────────────────────────────────
 
 def sync_dropbox(progress_cb=None):
-    """Download student photos from Dropbox to local PHOTOS_DIR."""
+    """List all image files in Dropbox and save a manifest. No photos downloaded."""
     dbx, err = require_dbx()
     if err:
         return {'success': False, 'error': err}
@@ -157,58 +185,38 @@ def sync_dropbox(progress_cb=None):
     import dropbox as dbx_module
 
     try:
-        if progress_cb: progress_cb('Listing files in Dropbox…')
-        result   = dbx.files_list_folder(DROPBOX_FOLDER, recursive=True)
-        entries  = list(result.entries)
+        if progress_cb: progress_cb('Connecting to Dropbox…')
+        result  = dbx.files_list_folder(DROPBOX_FOLDER, recursive=True)
+        entries = list(result.entries)
         while result.has_more:
-            result  = dbx.files_list_folder_continue(result.cursor)
+            if progress_cb: progress_cb(f'Listing files… ({len(entries)} found so far)')
+            result   = dbx.files_list_folder_continue(result.cursor)
             entries += result.entries
     except Exception as e:
         return {'success': False, 'error': f'Cannot access Dropbox folder "{DROPBOX_FOLDER}": {e}'}
 
-    downloaded = 0
-    skipped    = 0
-    errors     = []
-    total_imgs = sum(
-        1 for e in entries
-        if hasattr(e, 'name') and Path(e.name).suffix.lower() in IMG_EXTS
-    )
-
+    manifest = []
     for entry in entries:
+        if not isinstance(entry, dbx_module.files.FileMetadata):
+            continue
+        if Path(entry.name).suffix.lower() not in IMG_EXTS:
+            continue
+        # Strip base folder to get relative path; top-level subfolder = program name
         rel   = entry.path_display[len(DROPBOX_FOLDER):].lstrip('/')
-        local = PHOTOS_DIR / rel
+        parts = Path(rel).parts
+        folder = parts[0] if len(parts) > 1 else 'Unknown'
+        manifest.append({
+            'dropbox_path': entry.path_display,
+            'folder':       folder,
+            'name':         Path(entry.name).stem,
+            'size':         entry.size,
+        })
 
-        if isinstance(entry, dbx_module.files.FolderMetadata):
-            local.mkdir(parents=True, exist_ok=True)
-
-        elif isinstance(entry, dbx_module.files.FileMetadata):
-            if Path(entry.name).suffix.lower() not in IMG_EXTS:
-                continue
-            if local.exists() and local.stat().st_size == entry.size:
-                skipped += 1
-                continue
-            try:
-                local.parent.mkdir(parents=True, exist_ok=True)
-                _, response = dbx.files_download(entry.path_display)
-                local.write_bytes(response.content)
-                downloaded += 1
-                if progress_cb:
-                    progress_cb(
-                        f'Downloaded {downloaded} of {total_imgs - skipped} files…'
-                    )
-            except Exception as e:
-                errors.append(f'{entry.name}: {e}')
-
-    return {
-        'success':    True,
-        'downloaded': downloaded,
-        'skipped':    skipped,
-        'errors':     errors[:10],
-    }
+    MANIFEST_FILE.write_text(json.dumps(manifest))
+    return {'success': True, 'found': len(manifest)}
 
 
 def _start_sync_background():
-    """Start sync in a background thread. Returns False if already running."""
     global _sync_running
     with _sync_lock:
         if _sync_running:
@@ -220,21 +228,17 @@ def _start_sync_background():
         try:
             def cb(msg):
                 _write_status(SYNC_STATUS_FILE, {'state': 'running', 'message': msg})
-            _write_status(SYNC_STATUS_FILE, {'state': 'running', 'message': 'Starting sync…'})
+            _write_status(SYNC_STATUS_FILE, {'state': 'running', 'message': 'Starting…'})
             result = sync_dropbox(progress_cb=cb)
             if result.get('success'):
                 _write_status(SYNC_STATUS_FILE, {
-                    'state':      'done',
-                    'success':    True,
-                    'downloaded': result['downloaded'],
-                    'skipped':    result['skipped'],
-                    'errors':     result.get('errors', []),
+                    'state':   'done',
+                    'success': True,
+                    'found':   result['found'],
                 })
             else:
                 _write_status(SYNC_STATUS_FILE, {
-                    'state':   'done',
-                    'success': False,
-                    'error':   result['error'],
+                    'state': 'done', 'success': False, 'error': result['error'],
                 })
         except Exception as e:
             _write_status(SYNC_STATUS_FILE, {'state': 'done', 'success': False, 'error': str(e)})
@@ -244,69 +248,85 @@ def _start_sync_background():
     threading.Thread(target=run, daemon=True).start()
     return True
 
-
-# ── Photo scanning & indexing ─────────────────────────────────────────────────
-
-def scan_photos():
-    """Return all student photo dicts, scanning recursively under PHOTOS_DIR.
-    'folder' is always the top-level subfolder (degree program name).
-    """
-    photos = []
-    if not PHOTOS_DIR.exists():
-        return photos
-    for f in sorted(PHOTOS_DIR.rglob('*')):
-        if not f.is_file():
-            continue
-        if f.suffix.lower() not in IMG_EXTS:
-            continue
-        # Top-level subfolder = degree program name
-        try:
-            rel   = f.relative_to(PHOTOS_DIR)
-            parts = rel.parts
-            folder = parts[0] if len(parts) > 1 else 'Unknown'
-        except ValueError:
-            folder = 'Unknown'
-        photos.append({
-            'path':   str(f),
-            'folder': folder,
-            'name':   f.stem,
-        })
-    return photos
-
+# ── Face indexing (download-encode-delete per photo) ──────────────────────────
 
 def build_index(progress_cb=None):
+    """Download each photo from Dropbox temporarily, encode, delete immediately."""
     fr, np = require_fr()
     if fr is None:
         return {'success': False, 'error': 'face_recognition not installed.'}
 
-    photos = scan_photos()
-    if not photos:
-        return {'success': False, 'error': 'No photos found. Sync from Dropbox first.'}
+    if not MANIFEST_FILE.exists():
+        return {'success': False, 'error': 'No file list yet — sync from Dropbox first.'}
+
+    manifest = json.loads(MANIFEST_FILE.read_text())
+    if not manifest:
+        return {'success': False, 'error': 'Manifest is empty.'}
+
+    dbx, err = require_dbx()
+    if err:
+        return {'success': False, 'error': err}
+
+    # Load existing index so we can skip already-encoded photos (resume support)
+    existing = {}
+    if ENCODINGS_FILE.exists():
+        try:
+            with open(ENCODINGS_FILE, 'rb') as fh:
+                for d in pickle.load(fh):
+                    existing[d['dropbox_path']] = d
+        except Exception:
+            pass
 
     indexed = []
     skipped = []
-    total   = len(photos)
+    total   = len(manifest)
 
-    for i, p in enumerate(photos):
+    for i, item in enumerate(manifest):
         if progress_cb and i % 5 == 0:
-            progress_cb(f'Processing photo {i+1} of {total}…')
+            progress_cb(f'Processing {i+1} of {total}…')
+
+        # Already indexed — reuse
+        if item['dropbox_path'] in existing:
+            indexed.append(existing[item['dropbox_path']])
+            continue
+
+        tmp_path = None
         try:
-            img  = fr.load_image_file(p['path'])
+            suffix = Path(item['name']).suffix or '.jpg'
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp_path = tmp.name
+            _, response = dbx.files_download(item['dropbox_path'])
+            Path(tmp_path).write_bytes(response.content)
+
+            img  = fr.load_image_file(tmp_path)
             encs = fr.face_encodings(img, model='large')
             if encs:
                 indexed.append({
-                    'encoding': encs[0],
-                    'folder':   p['folder'],
-                    'name':     p['name'],
-                    'path':     p['path'],
+                    'encoding':     encs[0],
+                    'folder':       item['folder'],
+                    'name':         item['name'],
+                    'dropbox_path': item['dropbox_path'],
                 })
             else:
-                skipped.append(p['name'])
+                skipped.append(item['name'])
         except Exception as e:
-            skipped.append(f"{p['name']} ({e})")
+            skipped.append(f"{item['name']} ({e})")
+        finally:
+            if tmp_path and Path(tmp_path).exists():
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
+        # Checkpoint save every 50 photos so progress isn't lost if interrupted
+        if len(indexed) % 50 == 0 and indexed:
+            with open(ENCODINGS_FILE, 'wb') as fh:
+                pickle.dump(indexed, fh)
+
+    # Final save — local + Dropbox
     with open(ENCODINGS_FILE, 'wb') as fh:
         pickle.dump(indexed, fh)
+    _save_index_to_dropbox(indexed)
 
     return {
         'success':       True,
@@ -317,7 +337,6 @@ def build_index(progress_cb=None):
 
 
 def _start_index_background():
-    """Start index build in a background thread. Returns False if already running."""
     global _index_running
     with _index_lock:
         if _index_running:
@@ -341,9 +360,7 @@ def _start_index_background():
                 })
             else:
                 _write_status(INDEX_STATUS_FILE, {
-                    'state':   'done',
-                    'success': False,
-                    'error':   result['error'],
+                    'state': 'done', 'success': False, 'error': result['error'],
                 })
         except Exception as e:
             _write_status(INDEX_STATUS_FILE, {'state': 'done', 'success': False, 'error': str(e)})
@@ -353,6 +370,7 @@ def _start_index_background():
     threading.Thread(target=run, daemon=True).start()
     return True
 
+# ── Face search ───────────────────────────────────────────────────────────────
 
 def search_photo(image_path: str):
     fr, np = require_fr()
@@ -360,13 +378,13 @@ def search_photo(image_path: str):
         return None, 'face_recognition not installed.'
 
     if not ENCODINGS_FILE.exists():
-        return None, 'No index yet — sync photos from Dropbox, then click "Build Index".'
+        return None, 'No index yet — sync from Dropbox, then click "Build Index".'
 
     with open(ENCODINGS_FILE, 'rb') as fh:
         data = pickle.load(fh)
 
     if not data:
-        return None, 'Index is empty. Make sure photos were synced and indexed.'
+        return None, 'Index is empty. Sync and Build Index first.'
 
     img  = fr.load_image_file(image_path)
     encs = fr.face_encodings(img, model='large')
@@ -383,11 +401,11 @@ def search_photo(image_path: str):
         d = float(dists[idx])
         if d < 0.65:
             matches.append({
-                'folder':     data[idx]['folder'],
-                'name':       data[idx]['name'],
-                'path':       data[idx]['path'],
-                'confidence': round((1 - d) * 100, 1),
-                'distance':   round(d, 4),
+                'folder':       data[idx]['folder'],
+                'name':         data[idx]['name'],
+                'dropbox_path': data[idx]['dropbox_path'],
+                'confidence':   round((1 - d) * 100, 1),
+                'distance':     round(d, 4),
             })
 
     if not matches:
@@ -585,7 +603,6 @@ var _indexPoll = null;
 
 window.onload = function(){
   loadStatus();
-  // Resume polling if a background task was already running
   resumePolling();
 };
 
@@ -618,7 +635,7 @@ async function loadStatus(){
 
     if(!d.fr_installed){
       dot.className='dot r';
-      txt.innerHTML='<strong>face_recognition error:</strong> ' + (d.fr_error||'unknown — check Railway Deploy Logs');
+      txt.innerHTML='<strong>face_recognition error:</strong> '+(d.fr_error||'unknown — check Railway Deploy Logs');
       return;
     }
     if(!d.dropbox_configured){
@@ -626,17 +643,15 @@ async function loadStatus(){
       txt.textContent='Dropbox token not configured — set DROPBOX_TOKEN in Railway variables.';
       return;
     }
-    const synced  = d.local_photos;
-    const indexed = d.indexed;
-    if(synced===0){
+    if(d.manifest_count===0){
       dot.className='dot y';
-      txt.textContent='No photos synced yet — click "Sync from Dropbox" to start.';
-    } else if(indexed===0){
+      txt.textContent='No files listed yet — click "Sync from Dropbox" to start.';
+    } else if(d.indexed===0){
       dot.className='dot y';
-      txt.textContent=synced+' photos synced · Not indexed yet — click "Build Index".';
+      txt.textContent=d.manifest_count+' photos found in Dropbox · Not indexed yet — click "Build Index".';
     } else {
       dot.className='dot g';
-      txt.textContent='✓ '+indexed+' students indexed · '+synced+' photos on server';
+      txt.textContent='✓ '+d.indexed+' students indexed · '+d.manifest_count+' photos in Dropbox';
     }
   }catch(e){
     document.getElementById('stxt').textContent='Cannot reach server.';
@@ -647,14 +662,9 @@ async function loadStatus(){
 async function doSync(){
   setLoading('sync-btn','⬇','Starting…');
   document.getElementById('dot').className='dot y';
-  document.getElementById('stxt').textContent='Starting sync…';
+  document.getElementById('stxt').textContent='Listing files in Dropbox…';
   try{
     const d = await fetch('/api/sync',{method:'POST'}).then(r=>r.json());
-    if(d.already_running){
-      document.getElementById('stxt').textContent='Sync already in progress…';
-    } else {
-      document.getElementById('stxt').textContent='Syncing photos from Dropbox…';
-    }
     scheduleSyncPoll();
   }catch(e){
     document.getElementById('stxt').textContent='Could not start sync.';
@@ -662,10 +672,7 @@ async function doSync(){
   }
 }
 
-function scheduleSyncPoll(){
-  clearTimeout(_syncPoll);
-  _syncPoll = setTimeout(pollSync, 2000);
-}
+function scheduleSyncPoll(){ clearTimeout(_syncPoll); _syncPoll=setTimeout(pollSync,2000); }
 
 async function pollSync(){
   try{
@@ -676,7 +683,7 @@ async function pollSync(){
     } else if(d.state==='done'){
       if(d.success){
         document.getElementById('stxt').textContent=
-          '✓ Sync complete — '+d.downloaded+' new, '+d.skipped+' unchanged. Now click "Build Index".';
+          '✓ Found '+d.found+' photos in Dropbox. Now click "Build Index".';
         document.getElementById('dot').className='dot y';
       } else {
         document.getElementById('stxt').textContent='Sync error: '+d.error;
@@ -688,7 +695,6 @@ async function pollSync(){
       loadStatus();
     }
   }catch(e){
-    document.getElementById('stxt').textContent='Lost connection — retrying…';
     scheduleSyncPoll();
   }
 }
@@ -700,11 +706,8 @@ async function doIndex(){
   document.getElementById('stxt').textContent='Starting index build…';
   try{
     const d = await fetch('/api/index',{method:'POST'}).then(r=>r.json());
-    if(d.already_running){
-      document.getElementById('stxt').textContent='Index build already in progress…';
-    } else {
-      document.getElementById('stxt').textContent='Building face index — this may take several minutes…';
-    }
+    document.getElementById('stxt').textContent=
+      'Building face index — downloading & processing each photo. This takes a while…';
     scheduleIndexPoll();
   }catch(e){
     document.getElementById('stxt').textContent='Could not start index build.';
@@ -712,10 +715,7 @@ async function doIndex(){
   }
 }
 
-function scheduleIndexPoll(){
-  clearTimeout(_indexPoll);
-  _indexPoll = setTimeout(pollIndex, 2000);
-}
+function scheduleIndexPoll(){ clearTimeout(_indexPoll); _indexPoll=setTimeout(pollIndex,3000); }
 
 async function pollIndex(){
   try{
@@ -739,7 +739,6 @@ async function pollIndex(){
       loadStatus();
     }
   }catch(e){
-    document.getElementById('stxt').textContent='Lost connection — retrying…';
     scheduleIndexPoll();
   }
 }
@@ -783,7 +782,7 @@ function processFile(file){
           '<div class="err">⚠️ '+data.error+'</div>'; return;
       }
       const m=data.matches; const best=m[0];
-      const imgUrl='/api/photo?rel='+encodeURIComponent(best.rel)+'&token='+encodeURIComponent(best.token);
+      const imgUrl='/api/photo?token='+encodeURIComponent(best.token)+'&path='+encodeURIComponent(best.dropbox_path);
       let bc='lo',bt='? Low Confidence';
       if(best.confidence>=85){bc='hi';bt='✓ High Confidence';}
       else if(best.confidence>=70){bc='med';bt='~ Medium Confidence';}
@@ -814,7 +813,7 @@ function processFile(file){
 </html>"""
 
 
-# ── Login page HTML ───────────────────────────────────────────────────────────
+# ── Login page ────────────────────────────────────────────────────────────────
 
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -889,17 +888,28 @@ def index():
 @app.route('/api/status')
 @login_required
 def api_status():
-    fr, _        = require_fr()
-    local_photos = len(scan_photos())
-    indexed      = 0
+    fr, _ = require_fr()
+
+    manifest_count = 0
+    if MANIFEST_FILE.exists():
+        try:
+            manifest_count = len(json.loads(MANIFEST_FILE.read_text()))
+        except Exception:
+            pass
+
+    indexed = 0
     if ENCODINGS_FILE.exists():
-        with open(ENCODINGS_FILE, 'rb') as fh:
-            indexed = len(pickle.load(fh))
+        try:
+            with open(ENCODINGS_FILE, 'rb') as fh:
+                indexed = len(pickle.load(fh))
+        except Exception:
+            pass
+
     return jsonify({
         'fr_installed':       fr is not None,
         'fr_error':           _fr_error,
         'dropbox_configured': bool(DROPBOX_TOKEN),
-        'local_photos':       local_photos,
+        'manifest_count':     manifest_count,
         'indexed':            indexed,
     })
 
@@ -949,31 +959,37 @@ def api_search():
         return jsonify({'error': err})
 
     for m in matches:
-        rel = os.path.relpath(m['path'], str(PHOTOS_DIR))
-        m['token'] = sign_photo_url(rel)
-        m['rel']   = rel
+        m['token'] = sign_photo_url(m['dropbox_path'])
     return jsonify({'matches': matches})
 
 
 @app.route('/api/photo')
 @login_required
 def api_photo():
-    rel   = request.args.get('rel', '')
-    token = request.args.get('token', '')
+    """Proxy a student photo from Dropbox — only with a valid signed token."""
+    dropbox_path = request.args.get('path', '')
+    token        = request.args.get('token', '')
 
-    if not rel or not token:
+    if not dropbox_path or not token:
         return 'Forbidden', 403
-    if not verify_photo_token(rel, token):
+    if not verify_photo_token(dropbox_path, token):
         return 'Link expired or invalid', 403
 
-    abs_path    = (PHOTOS_DIR / rel).resolve()
-    photos_root = PHOTOS_DIR.resolve()
-    if not str(abs_path).startswith(str(photos_root)):
-        return 'Forbidden', 403
-    if not abs_path.exists():
-        return 'Not found', 404
+    dbx, err = require_dbx()
+    if err:
+        return err, 500
 
-    return send_file(str(abs_path))
+    try:
+        _, response = dbx.files_download(dropbox_path)
+        suffix = Path(dropbox_path).suffix.lower()
+        mime = {
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+            '.png': 'image/png',  '.webp': 'image/webp',
+            '.bmp': 'image/bmp',  '.tiff': 'image/tiff',
+        }.get(suffix, 'image/jpeg')
+        return Response(response.content, mimetype=mime)
+    except Exception as e:
+        return f'Error fetching photo: {e}', 500
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
