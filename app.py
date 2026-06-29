@@ -5,11 +5,13 @@ Hosted version: Dropbox photo sync + face recognition + mobile-ready UI.
 """
 
 import os
+import json
 import pickle
 import tempfile
 import hmac
 import hashlib
 import time
+import threading
 from functools import wraps
 from pathlib import Path
 from flask import (Flask, request, jsonify, send_file,
@@ -21,6 +23,8 @@ app = Flask(__name__)
 BASE_DIR       = Path(__file__).parent
 PHOTOS_DIR     = BASE_DIR / 'photos'          # local cache synced from Dropbox
 ENCODINGS_FILE = BASE_DIR / 'face_index.pkl'
+SYNC_STATUS_FILE  = BASE_DIR / 'sync_status.json'
+INDEX_STATUS_FILE = BASE_DIR / 'index_status.json'
 IMG_EXTS       = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp', '.heic'}
 
 DROPBOX_TOKEN  = os.environ.get('DROPBOX_TOKEN', '')
@@ -28,8 +32,6 @@ DROPBOX_FOLDER = os.environ.get('DROPBOX_FOLDER', '/Student Photos')
 APP_PASSWORD   = os.environ.get('APP_PASSWORD', '')   # blank = no password required
 
 # Secret key: signs sessions + photo URL tokens.
-# Set SECRET_KEY in Railway so it stays stable across redeploys.
-# If unset, a random key is generated per boot (sessions reset on restart).
 _SECRET = os.environ.get('SECRET_KEY', os.urandom(32).hex())
 app.secret_key = _SECRET
 
@@ -38,7 +40,6 @@ PHOTOS_DIR.mkdir(exist_ok=True)
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
 def login_required(f):
-    """Redirect to /login if APP_PASSWORD is set and user is not authenticated."""
     @wraps(f)
     def decorated(*args, **kwargs):
         if APP_PASSWORD and not session.get('authenticated'):
@@ -48,15 +49,13 @@ def login_required(f):
 
 
 def sign_photo_url(rel_path: str) -> str:
-    """Return an HMAC-signed token for rel_path, valid for 1 hour."""
     expiry  = int(time.time()) + 3600
     message = f"{rel_path}:{expiry}".encode()
-    sig     = hmac.new(_SECRET.encode(), message, hashlib.sha256).hexdigest()  # type: ignore
+    sig     = hmac.new(_SECRET.encode(), message, hashlib.sha256).hexdigest()
     return f"{expiry}:{sig}"
 
 
 def verify_photo_token(rel_path: str, token: str) -> bool:
-    """Return True only if the token is valid and not expired."""
     try:
         expiry_str, sig = token.split(':', 1)
         expiry = int(expiry_str)
@@ -79,7 +78,7 @@ def _patch_pkg_resources():
     We inject a minimal shim so the import succeeds.
     """
     try:
-        import pkg_resources  # already available — nothing to do
+        import pkg_resources
         return
     except ImportError:
         pass
@@ -123,9 +122,33 @@ def require_dbx():
         return None, 'dropbox package not installed — run: pip install dropbox'
 
 
+# ── Background task helpers ───────────────────────────────────────────────────
+
+_sync_lock  = threading.Lock()
+_index_lock = threading.Lock()
+_sync_running  = False
+_index_running = False
+
+
+def _write_status(path: Path, data: dict):
+    try:
+        path.write_text(json.dumps(data))
+    except Exception as e:
+        print(f"[status write error] {e}", flush=True)
+
+
+def _read_status(path: Path) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            pass
+    return {'state': 'idle'}
+
+
 # ── Dropbox sync ──────────────────────────────────────────────────────────────
 
-def sync_dropbox():
+def sync_dropbox(progress_cb=None):
     """Download student photos from Dropbox to local PHOTOS_DIR."""
     dbx, err = require_dbx()
     if err:
@@ -134,7 +157,7 @@ def sync_dropbox():
     import dropbox as dbx_module
 
     try:
-        # Walk entire folder tree
+        if progress_cb: progress_cb('Listing files in Dropbox…')
         result   = dbx.files_list_folder(DROPBOX_FOLDER, recursive=True)
         entries  = list(result.entries)
         while result.has_more:
@@ -146,10 +169,13 @@ def sync_dropbox():
     downloaded = 0
     skipped    = 0
     errors     = []
+    total_imgs = sum(
+        1 for e in entries
+        if hasattr(e, 'name') and Path(e.name).suffix.lower() in IMG_EXTS
+    )
 
     for entry in entries:
-        # Strip the Dropbox base folder to get a relative path
-        rel = entry.path_display[len(DROPBOX_FOLDER):].lstrip('/')
+        rel   = entry.path_display[len(DROPBOX_FOLDER):].lstrip('/')
         local = PHOTOS_DIR / rel
 
         if isinstance(entry, dbx_module.files.FolderMetadata):
@@ -158,7 +184,6 @@ def sync_dropbox():
         elif isinstance(entry, dbx_module.files.FileMetadata):
             if Path(entry.name).suffix.lower() not in IMG_EXTS:
                 continue
-            # Skip if already downloaded and same size
             if local.exists() and local.stat().st_size == entry.size:
                 skipped += 1
                 continue
@@ -167,6 +192,10 @@ def sync_dropbox():
                 _, response = dbx.files_download(entry.path_display)
                 local.write_bytes(response.content)
                 downloaded += 1
+                if progress_cb:
+                    progress_cb(
+                        f'Downloaded {downloaded} of {total_imgs - skipped} files…'
+                    )
             except Exception as e:
                 errors.append(f'{entry.name}: {e}')
 
@@ -178,10 +207,47 @@ def sync_dropbox():
     }
 
 
+def _start_sync_background():
+    """Start sync in a background thread. Returns False if already running."""
+    global _sync_running
+    with _sync_lock:
+        if _sync_running:
+            return False
+        _sync_running = True
+
+    def run():
+        global _sync_running
+        try:
+            def cb(msg):
+                _write_status(SYNC_STATUS_FILE, {'state': 'running', 'message': msg})
+            _write_status(SYNC_STATUS_FILE, {'state': 'running', 'message': 'Starting sync…'})
+            result = sync_dropbox(progress_cb=cb)
+            if result.get('success'):
+                _write_status(SYNC_STATUS_FILE, {
+                    'state':      'done',
+                    'success':    True,
+                    'downloaded': result['downloaded'],
+                    'skipped':    result['skipped'],
+                    'errors':     result.get('errors', []),
+                })
+            else:
+                _write_status(SYNC_STATUS_FILE, {
+                    'state':   'done',
+                    'success': False,
+                    'error':   result['error'],
+                })
+        except Exception as e:
+            _write_status(SYNC_STATUS_FILE, {'state': 'done', 'success': False, 'error': str(e)})
+        finally:
+            _sync_running = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+
 # ── Photo scanning & indexing ─────────────────────────────────────────────────
 
 def scan_photos():
-    """Return all student photo dicts from local PHOTOS_DIR."""
     photos = []
     if not PHOTOS_DIR.exists():
         return photos
@@ -198,20 +264,22 @@ def scan_photos():
     return photos
 
 
-def build_index():
-    """Extract face encodings for every student photo and save index."""
+def build_index(progress_cb=None):
     fr, np = require_fr()
     if fr is None:
         return {'success': False, 'error': 'face_recognition not installed.'}
 
-    photos  = scan_photos()
+    photos = scan_photos()
     if not photos:
         return {'success': False, 'error': 'No photos found. Sync from Dropbox first.'}
 
     indexed = []
     skipped = []
+    total   = len(photos)
 
-    for p in photos:
+    for i, p in enumerate(photos):
+        if progress_cb and i % 5 == 0:
+            progress_cb(f'Processing photo {i+1} of {total}…')
         try:
             img  = fr.load_image_file(p['path'])
             encs = fr.face_encodings(img, model='large')
@@ -231,15 +299,52 @@ def build_index():
         pickle.dump(indexed, fh)
 
     return {
-        'success': True,
-        'indexed': len(indexed),
-        'skipped': len(skipped),
+        'success':       True,
+        'indexed':       len(indexed),
+        'skipped':       len(skipped),
         'skipped_names': skipped[:20],
     }
 
 
+def _start_index_background():
+    """Start index build in a background thread. Returns False if already running."""
+    global _index_running
+    with _index_lock:
+        if _index_running:
+            return False
+        _index_running = True
+
+    def run():
+        global _index_running
+        try:
+            def cb(msg):
+                _write_status(INDEX_STATUS_FILE, {'state': 'running', 'message': msg})
+            _write_status(INDEX_STATUS_FILE, {'state': 'running', 'message': 'Starting…'})
+            result = build_index(progress_cb=cb)
+            if result.get('success'):
+                _write_status(INDEX_STATUS_FILE, {
+                    'state':         'done',
+                    'success':       True,
+                    'indexed':       result['indexed'],
+                    'skipped':       result['skipped'],
+                    'skipped_names': result.get('skipped_names', []),
+                })
+            else:
+                _write_status(INDEX_STATUS_FILE, {
+                    'state':   'done',
+                    'success': False,
+                    'error':   result['error'],
+                })
+        except Exception as e:
+            _write_status(INDEX_STATUS_FILE, {'state': 'done', 'success': False, 'error': str(e)})
+        finally:
+            _index_running = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+
 def search_photo(image_path: str):
-    """Return (matches_list, error_str). One will be None."""
     fr, np = require_fr()
     if fr is None:
         return None, 'face_recognition not installed.'
@@ -305,7 +410,6 @@ HTML = r"""<!DOCTYPE html>
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
      background:var(--bg);color:var(--text);min-height:100vh}
 
-/* ── header ── */
 header{background:var(--blue);color:#fff;padding:14px 20px;
        display:flex;align-items:center;gap:12px;
        box-shadow:0 2px 10px rgba(0,0,0,.2)}
@@ -314,7 +418,6 @@ header p{font-size:12px;opacity:.7;margin-top:2px}
 
 .wrap{max-width:980px;margin:0 auto;padding:18px 16px}
 
-/* ── status bar ── */
 .sbar{background:var(--card);border:1px solid var(--border);border-radius:12px;
       padding:12px 16px;margin-bottom:16px;display:flex;flex-wrap:wrap;
       align-items:center;justify-content:space-between;gap:10px}
@@ -323,7 +426,6 @@ header p{font-size:12px;opacity:.7;margin-top:2px}
 .dot.g{background:var(--green)}.dot.y{background:var(--amber)}.dot.r{background:var(--red)}
 .sactions{display:flex;gap:8px;flex-wrap:wrap}
 
-/* ── buttons ── */
 .btn{padding:8px 15px;border-radius:8px;border:none;cursor:pointer;
      font-size:13.5px;font-weight:500;display:inline-flex;align-items:center;
      gap:6px;transition:.15s;white-space:nowrap}
@@ -333,7 +435,6 @@ header p{font-size:12px;opacity:.7;margin-top:2px}
 .btn-sm{padding:6px 12px;font-size:12.5px}
 .btn:disabled{opacity:.45;cursor:not-allowed}
 
-/* ── upload zone (desktop) ── */
 .upzone{background:var(--card);border:2.5px dashed var(--border);border-radius:14px;
         padding:44px 20px;text-align:center;cursor:pointer;transition:.2s;
         margin-bottom:18px}
@@ -342,7 +443,6 @@ header p{font-size:12px;opacity:.7;margin-top:2px}
 .upzone p{color:var(--muted);font-size:15px;margin-bottom:5px}
 .upzone small{color:#9ca3af;font-size:13px}
 
-/* ── mobile upload buttons ── */
 .mob-btns{display:none;gap:12px;margin-bottom:18px}
 .mob-btn{flex:1;padding:18px 10px;border-radius:14px;border:none;cursor:pointer;
          font-size:15px;font-weight:600;display:flex;flex-direction:column;
@@ -353,7 +453,6 @@ header p{font-size:12px;opacity:.7;margin-top:2px}
 
 input[type=file]{display:none}
 
-/* ── results ── */
 .results{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px}
 .clabel{font-size:11px;font-weight:700;color:var(--muted);
@@ -366,7 +465,6 @@ input[type=file]{display:none}
      display:flex;flex-direction:column;align-items:center;justify-content:center;
      color:var(--muted);gap:8px;font-size:13px}
 
-/* match details */
 .mname{font-size:21px;font-weight:800;margin:12px 0 3px;line-height:1.2}
 .mfolder{font-size:13px;color:var(--muted);margin-bottom:10px;
          display:flex;align-items:center;gap:5px}
@@ -400,7 +498,6 @@ input[type=file]{display:none}
       animation:sp .75s linear infinite;display:inline-block}
 @keyframes sp{to{transform:rotate(360deg)}}
 
-/* ── responsive ── */
 @media(max-width:640px){
   .results{grid-template-columns:1fr}
   .upzone{display:none}
@@ -424,7 +521,6 @@ input[type=file]{display:none}
 
 <div class="wrap">
 
-  <!-- Status + action buttons -->
   <div class="sbar">
     <div class="sinfo">
       <div class="dot" id="dot"></div>
@@ -436,7 +532,6 @@ input[type=file]{display:none}
     </div>
   </div>
 
-  <!-- Desktop drag-drop zone -->
   <div class="upzone" id="zone"
        onclick="document.getElementById('fi-gallery').click()"
        ondrop="onDrop(event)" ondragover="onDragOver(event)" ondragleave="onDragLeave(event)">
@@ -445,7 +540,6 @@ input[type=file]{display:none}
     <small>or click to browse &nbsp;·&nbsp; JPG, PNG, HEIC</small>
   </div>
 
-  <!-- Mobile buttons -->
   <div class="mob-btns">
     <button class="mob-btn" onclick="document.getElementById('fi-camera').click()">
       <span class="mico">📷</span>
@@ -457,11 +551,9 @@ input[type=file]{display:none}
     </button>
   </div>
 
-  <!-- Hidden file inputs -->
   <input type="file" id="fi-camera"  accept="image/*" capture="environment" onchange="onFile(event)">
   <input type="file" id="fi-gallery" accept="image/*" onchange="onFile(event)">
 
-  <!-- Results -->
   <div id="results" style="display:none">
     <div class="results">
       <div class="card">
@@ -475,10 +567,38 @@ input[type=file]{display:none}
     </div>
   </div>
 
-</div><!-- /wrap -->
+</div>
 
 <script>
-window.onload = loadStatus;
+var _syncPoll  = null;
+var _indexPoll = null;
+
+window.onload = function(){
+  loadStatus();
+  // Resume polling if a background task was already running
+  resumePolling();
+};
+
+async function resumePolling(){
+  try{
+    const s = await fetch('/api/sync_status').then(r=>r.json());
+    if(s.state==='running'){
+      setLoading('sync-btn','⬇','Syncing…');
+      document.getElementById('dot').className='dot y';
+      document.getElementById('stxt').textContent=s.message||'Syncing…';
+      scheduleSyncPoll();
+    }
+  }catch(e){}
+  try{
+    const s = await fetch('/api/index_status').then(r=>r.json());
+    if(s.state==='running'){
+      setLoading('idx-btn','⚙','Indexing…');
+      document.getElementById('dot').className='dot y';
+      document.getElementById('stxt').textContent=s.message||'Building index…';
+      scheduleIndexPoll();
+    }
+  }catch(e){}
+}
 
 async function loadStatus(){
   try{
@@ -488,79 +608,136 @@ async function loadStatus(){
 
     if(!d.fr_installed){
       dot.className='dot r';
-      txt.innerHTML='<strong>face_recognition error:</strong> ' + (d.fr_error || 'unknown — check Railway Deploy Logs');
+      txt.innerHTML='<strong>face_recognition error:</strong> ' + (d.fr_error||'unknown — check Railway Deploy Logs');
       return;
     }
-
     if(!d.dropbox_configured){
       dot.className='dot y';
       txt.textContent='Dropbox token not configured — set DROPBOX_TOKEN in Railway variables.';
       return;
     }
-
     const synced  = d.local_photos;
     const indexed = d.indexed;
-
     if(synced===0){
       dot.className='dot y';
-      txt.textContent=`No photos synced yet — click "Sync from Dropbox" to start.`;
+      txt.textContent='No photos synced yet — click "Sync from Dropbox" to start.';
     } else if(indexed===0){
       dot.className='dot y';
-      txt.textContent=`${synced} photos synced · Not indexed yet — click "Build Index".`;
+      txt.textContent=synced+' photos synced · Not indexed yet — click "Build Index".';
     } else {
       dot.className='dot g';
-      txt.textContent=`✓ ${indexed} students indexed · ${synced} photos on server`;
+      txt.textContent='✓ '+indexed+' students indexed · '+synced+' photos on server';
     }
-  } catch(e){
+  }catch(e){
     document.getElementById('stxt').textContent='Cannot reach server.';
   }
 }
 
+/* ── Sync ── */
 async function doSync(){
-  setLoading('sync-btn','⬇','Syncing…');
+  setLoading('sync-btn','⬇','Starting…');
   document.getElementById('dot').className='dot y';
-  document.getElementById('stxt').textContent='Syncing photos from Dropbox…';
+  document.getElementById('stxt').textContent='Starting sync…';
   try{
     const d = await fetch('/api/sync',{method:'POST'}).then(r=>r.json());
-    if(d.success){
-      document.getElementById('stxt').textContent=
-        `✓ Sync complete — ${d.downloaded} new, ${d.skipped} unchanged. Now click "Build Index".`;
-      document.getElementById('dot').className='dot y';
+    if(d.already_running){
+      document.getElementById('stxt').textContent='Sync already in progress…';
     } else {
-      document.getElementById('stxt').textContent='Sync error: '+d.error;
-      document.getElementById('dot').className='dot r';
+      document.getElementById('stxt').textContent='Syncing photos from Dropbox…';
     }
-  } catch(e){
-    document.getElementById('stxt').textContent='Sync failed.';
+    scheduleSyncPoll();
+  }catch(e){
+    document.getElementById('stxt').textContent='Could not start sync.';
+    resetBtn('sync-btn','⬇ Sync from Dropbox');
   }
-  resetBtn('sync-btn','⬇ Sync from Dropbox');
 }
 
+function scheduleSyncPoll(){
+  clearTimeout(_syncPoll);
+  _syncPoll = setTimeout(pollSync, 2000);
+}
+
+async function pollSync(){
+  try{
+    const d = await fetch('/api/sync_status').then(r=>r.json());
+    if(d.state==='running'){
+      document.getElementById('stxt').textContent=d.message||'Syncing…';
+      scheduleSyncPoll();
+    } else if(d.state==='done'){
+      if(d.success){
+        document.getElementById('stxt').textContent=
+          '✓ Sync complete — '+d.downloaded+' new, '+d.skipped+' unchanged. Now click "Build Index".';
+        document.getElementById('dot').className='dot y';
+      } else {
+        document.getElementById('stxt').textContent='Sync error: '+d.error;
+        document.getElementById('dot').className='dot r';
+      }
+      resetBtn('sync-btn','⬇ Sync from Dropbox');
+    } else {
+      resetBtn('sync-btn','⬇ Sync from Dropbox');
+      loadStatus();
+    }
+  }catch(e){
+    document.getElementById('stxt').textContent='Lost connection — retrying…';
+    scheduleSyncPoll();
+  }
+}
+
+/* ── Index ── */
 async function doIndex(){
-  setLoading('idx-btn','⚙','Indexing…');
+  setLoading('idx-btn','⚙','Starting…');
   document.getElementById('dot').className='dot y';
-  document.getElementById('stxt').textContent='Building face index — this takes a few minutes…';
+  document.getElementById('stxt').textContent='Starting index build…';
   try{
     const d = await fetch('/api/index',{method:'POST'}).then(r=>r.json());
-    if(d.success){
-      document.getElementById('dot').className='dot g';
-      let msg=`✓ ${d.indexed} students indexed`;
-      if(d.skipped>0) msg+=` · ${d.skipped} skipped (no face detected)`;
-      document.getElementById('stxt').textContent=msg;
+    if(d.already_running){
+      document.getElementById('stxt').textContent='Index build already in progress…';
     } else {
-      document.getElementById('dot').className='dot r';
-      document.getElementById('stxt').textContent='Index error: '+d.error;
+      document.getElementById('stxt').textContent='Building face index — this may take several minutes…';
     }
-  } catch(e){
-    document.getElementById('stxt').textContent='Indexing failed.';
+    scheduleIndexPoll();
+  }catch(e){
+    document.getElementById('stxt').textContent='Could not start index build.';
+    resetBtn('idx-btn','⚙ Build Index');
   }
-  resetBtn('idx-btn','⚙ Build Index');
+}
+
+function scheduleIndexPoll(){
+  clearTimeout(_indexPoll);
+  _indexPoll = setTimeout(pollIndex, 2000);
+}
+
+async function pollIndex(){
+  try{
+    const d = await fetch('/api/index_status').then(r=>r.json());
+    if(d.state==='running'){
+      document.getElementById('stxt').textContent=d.message||'Building index…';
+      scheduleIndexPoll();
+    } else if(d.state==='done'){
+      if(d.success){
+        document.getElementById('dot').className='dot g';
+        let msg='✓ '+d.indexed+' students indexed';
+        if(d.skipped>0) msg+=' · '+d.skipped+' skipped (no face detected)';
+        document.getElementById('stxt').textContent=msg;
+      } else {
+        document.getElementById('dot').className='dot r';
+        document.getElementById('stxt').textContent='Index error: '+d.error;
+      }
+      resetBtn('idx-btn','⚙ Build Index');
+    } else {
+      resetBtn('idx-btn','⚙ Build Index');
+      loadStatus();
+    }
+  }catch(e){
+    document.getElementById('stxt').textContent='Lost connection — retrying…';
+    scheduleIndexPoll();
+  }
 }
 
 function setLoading(id,icon,label){
   const b=document.getElementById(id);
   b.disabled=true;
-  b.innerHTML=`<span class="spin"></span> ${label}`;
+  b.innerHTML='<span class="spin"></span> '+label;
 }
 function resetBtn(id,label){
   const b=document.getElementById(id);
@@ -579,60 +756,47 @@ function onFile(e){const f=e.target.files[0];if(f)processFile(f);e.target.value=
 
 function processFile(file){
   document.getElementById('results').style.display='block';
-
-  // Show preview
   const reader=new FileReader();
   reader.onload=e=>{
     document.getElementById('upv').innerHTML=
-      `<div class="pbox"><img src="${e.target.result}" alt="Uploaded"></div>`;
+      '<div class="pbox"><img src="'+e.target.result+'" alt="Uploaded"></div>';
   };
   reader.readAsDataURL(file);
-
-  // Searching state
   document.getElementById('matchbox').innerHTML=
-    `<div class="searching"><div class="bspin"></div><p>Searching student records…</p></div>`;
-
+    '<div class="searching"><div class="bspin"></div><p>Searching student records…</p></div>';
   const fd=new FormData(); fd.append('image',file);
   fetch('/api/search',{method:'POST',body:fd})
     .then(r=>r.json())
     .then(data=>{
       if(data.error){
         document.getElementById('matchbox').innerHTML=
-          `<div class="err">⚠️ ${data.error}</div>`; return;
+          '<div class="err">⚠️ '+data.error+'</div>'; return;
       }
       const m=data.matches; const best=m[0];
-      const imgUrl=`/api/photo?rel=${encodeURIComponent(best.rel)}&token=${encodeURIComponent(best.token)}`;
+      const imgUrl='/api/photo?rel='+encodeURIComponent(best.rel)+'&token='+encodeURIComponent(best.token);
       let bc='lo',bt='? Low Confidence';
       if(best.confidence>=85){bc='hi';bt='✓ High Confidence';}
       else if(best.confidence>=70){bc='med';bt='~ Medium Confidence';}
-
       let altHtml='';
       if(m.length>1){
-        altHtml=`<div class="alts">
-          <div class="alt-title">Other possible matches</div>
-          ${m.slice(1).map(x=>`<div class="alt-row">
-            <div><strong>${x.name}</strong>
-              <div style="font-size:11px;color:var(--muted)">${x.folder}</div></div>
-            <span class="alt-pct">${x.confidence}%</span>
-          </div>`).join('')}
-        </div>`;
+        altHtml='<div class="alts"><div class="alt-title">Other possible matches</div>'+
+          m.slice(1).map(x=>'<div class="alt-row"><div><strong>'+x.name+'</strong>'+
+            '<div style="font-size:11px;color:var(--muted)">'+x.folder+'</div></div>'+
+            '<span class="alt-pct">'+x.confidence+'%</span></div>').join('')+'</div>';
       }
-
-      document.getElementById('matchbox').innerHTML=`
-        <div class="pbox">
-          <img src="${imgUrl}" alt="Match"
-            onerror="this.closest('.pbox').innerHTML='<div class=pph>📷<span>Photo unavailable</span></div>'">
-        </div>
-        <div class="mname">${best.name}</div>
-        <div class="mfolder">📁 ${best.folder}</div>
-        <span class="badge ${bc}">${bt}</span>
-        <div class="cbar-lbl"><span>Match confidence</span><span>${best.confidence}%</span></div>
-        <div class="cbar"><div class="cfill" style="width:${best.confidence}%"></div></div>
-        ${altHtml}`;
+      document.getElementById('matchbox').innerHTML=
+        '<div class="pbox"><img src="'+imgUrl+'" alt="Match"'+
+        ' onerror="this.closest(\'.pbox\').innerHTML=\'<div class=pph>📷<span>Photo unavailable</span></div>\'"></div>'+
+        '<div class="mname">'+best.name+'</div>'+
+        '<div class="mfolder">📁 '+best.folder+'</div>'+
+        '<span class="badge '+bc+'">'+bt+'</span>'+
+        '<div class="cbar-lbl"><span>Match confidence</span><span>'+best.confidence+'%</span></div>'+
+        '<div class="cbar"><div class="cfill" style="width:'+best.confidence+'%"></div></div>'+
+        altHtml;
     })
     .catch(()=>{
       document.getElementById('matchbox').innerHTML=
-        `<div class="err">⚠️ Connection error. Please try again.</div>`;
+        '<div class="err">⚠️ Connection error. Please try again.</div>';
     });
 }
 </script>
@@ -733,13 +897,31 @@ def api_status():
 @app.route('/api/sync', methods=['POST'])
 @login_required
 def api_sync():
-    return jsonify(sync_dropbox())
+    started = _start_sync_background()
+    if not started:
+        return jsonify({'started': False, 'already_running': True})
+    return jsonify({'started': True})
+
+
+@app.route('/api/sync_status')
+@login_required
+def api_sync_status():
+    return jsonify(_read_status(SYNC_STATUS_FILE))
 
 
 @app.route('/api/index', methods=['POST'])
 @login_required
 def api_index():
-    return jsonify(build_index())
+    started = _start_index_background()
+    if not started:
+        return jsonify({'started': False, 'already_running': True})
+    return jsonify({'started': True})
+
+
+@app.route('/api/index_status')
+@login_required
+def api_index_status():
+    return jsonify(_read_status(INDEX_STATUS_FILE))
 
 
 @app.route('/api/search', methods=['POST'])
@@ -756,8 +938,6 @@ def api_search():
     if err:
         return jsonify({'error': err})
 
-    # Attach signed URLs to each match so photos can only be fetched
-    # through a valid, time-limited token — not shared as bare links.
     for m in matches:
         rel = os.path.relpath(m['path'], str(PHOTOS_DIR))
         m['token'] = sign_photo_url(rel)
@@ -768,12 +948,6 @@ def api_search():
 @app.route('/api/photo')
 @login_required
 def api_photo():
-    """
-    Serve a student photo only if:
-      1. The user is authenticated (login_required), AND
-      2. The request carries a valid, non-expired HMAC token.
-    This prevents anyone from guessing or sharing direct photo URLs.
-    """
     rel   = request.args.get('rel', '')
     token = request.args.get('token', '')
 
@@ -782,9 +956,8 @@ def api_photo():
     if not verify_photo_token(rel, token):
         return 'Link expired or invalid', 403
 
-    abs_path = (PHOTOS_DIR / rel).resolve()
+    abs_path    = (PHOTOS_DIR / rel).resolve()
     photos_root = PHOTOS_DIR.resolve()
-    # Guard against path traversal
     if not str(abs_path).startswith(str(photos_root)):
         return 'Forbidden', 403
     if not abs_path.exists():
