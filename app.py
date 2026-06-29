@@ -21,8 +21,8 @@ app = Flask(__name__)
 
 # ── Config (set via environment variables on Railway) ────────────────────────
 BASE_DIR       = Path(__file__).parent
-PHOTOS_DIR     = BASE_DIR / 'photos'          # local cache synced from Dropbox
-ENCODINGS_FILE = BASE_DIR / 'face_index.pkl'
+PHOTOS_DIR     = BASE_DIR / 'photos'          # local cache synced from Dropbox (Railway Volume)
+ENCODINGS_FILE = PHOTOS_DIR / 'face_index.pkl'  # stored on the volume — survives redeploys
 SYNC_STATUS_FILE  = BASE_DIR / 'sync_status.json'
 INDEX_STATUS_FILE = BASE_DIR / 'index_status.json'
 IMG_EXTS       = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp', '.heic'}
@@ -248,19 +248,29 @@ def _start_sync_background():
 # ── Photo scanning & indexing ─────────────────────────────────────────────────
 
 def scan_photos():
+    """Return all student photo dicts, scanning recursively under PHOTOS_DIR.
+    'folder' is always the top-level subfolder (degree program name).
+    """
     photos = []
     if not PHOTOS_DIR.exists():
         return photos
-    for folder in sorted(PHOTOS_DIR.iterdir()):
-        if not folder.is_dir() or folder.name.startswith('.'):
+    for f in sorted(PHOTOS_DIR.rglob('*')):
+        if not f.is_file():
             continue
-        for f in sorted(folder.iterdir()):
-            if f.is_file() and f.suffix.lower() in IMG_EXTS:
-                photos.append({
-                    'path':   str(f),
-                    'folder': folder.name,
-                    'name':   f.stem,
-                })
+        if f.suffix.lower() not in IMG_EXTS:
+            continue
+        # Top-level subfolder = degree program name
+        try:
+            rel   = f.relative_to(PHOTOS_DIR)
+            parts = rel.parts
+            folder = parts[0] if len(parts) > 1 else 'Unknown'
+        except ValueError:
+            folder = 'Unknown'
+        photos.append({
+            'path':   str(f),
+            'folder': folder,
+            'name':   f.stem,
+        })
     return photos
 
 
