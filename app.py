@@ -72,6 +72,36 @@ def verify_photo_token(rel_path: str, token: str) -> bool:
 
 _fr_error = None
 
+def _patch_pkg_resources():
+    """
+    Python 3.12 venvs don't include pkg_resources by default.
+    face_recognition_models uses it to locate model files.
+    We inject a minimal shim so the import succeeds.
+    """
+    try:
+        import pkg_resources  # already available — nothing to do
+        return
+    except ImportError:
+        pass
+    import sys, os, types, importlib.util
+
+    pkg = types.ModuleType('pkg_resources')
+
+    def resource_filename(package_or_req, resource_name):
+        name = package_or_req if isinstance(package_or_req, str) else package_or_req.__name__
+        spec = importlib.util.find_spec(name)
+        if spec and spec.origin:
+            return os.path.join(os.path.dirname(spec.origin), resource_name)
+        return resource_name
+
+    pkg.resource_filename = resource_filename
+    sys.modules['pkg_resources'] = pkg
+    print("[startup] pkg_resources shim installed", flush=True)
+
+
+_patch_pkg_resources()   # run once at startup
+
+
 def require_fr():
     global _fr_error
     try:
