@@ -250,6 +250,18 @@ def _start_sync_background():
 
 # ── Face indexing (download-encode-delete per photo) ──────────────────────────
 
+def _load_resized(path: str, max_dim: int = 800):
+    """Load an image and shrink it to max_dim on the longest side before encoding."""
+    from PIL import Image
+    import numpy as np_
+    img = Image.open(path).convert('RGB')
+    w, h = img.size
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    return np_.array(img)
+
+
 def build_index(progress_cb=None):
     """Download each photo from Dropbox temporarily, encode, delete immediately."""
     fr, np = require_fr()
@@ -298,8 +310,9 @@ def build_index(progress_cb=None):
             _, response = dbx.files_download(item['dropbox_path'])
             Path(tmp_path).write_bytes(response.content)
 
-            img  = fr.load_image_file(tmp_path)
-            encs = fr.face_encodings(img, model='large')
+            # Resize large images before encoding — major speedup on high-res photos
+            img = _load_resized(tmp_path, max_dim=800)
+            encs = fr.face_encodings(img, model='small')
             if encs:
                 indexed.append({
                     'encoding':     encs[0],
@@ -386,8 +399,8 @@ def search_photo(image_path: str):
     if not data:
         return None, 'Index is empty. Sync and Build Index first.'
 
-    img  = fr.load_image_file(image_path)
-    encs = fr.face_encodings(img, model='large')
+    img  = _load_resized(image_path, max_dim=800)
+    encs = fr.face_encodings(img, model='small')
 
     if not encs:
         return None, 'No face detected. Try a clearer, well-lit photo of the framed portrait.'
