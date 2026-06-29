@@ -74,7 +74,7 @@ def require_fr():
     try:
         import face_recognition, numpy as np
         return face_recognition, np
-    except ImportError:
+    except BaseException:        ← change ImportError to BaseException
         return None, None
 
 def require_dbx():
