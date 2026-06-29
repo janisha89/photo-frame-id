@@ -70,11 +70,17 @@ def verify_photo_token(rel_path: str, token: str) -> bool:
 
 # ── Lazy imports ─────────────────────────────────────────────────────────────
 
+_fr_error = None
+
 def require_fr():
+    global _fr_error
     try:
         import face_recognition, numpy as np
+        _fr_error = None
         return face_recognition, np
-    except BaseException:
+    except BaseException as e:
+        _fr_error = f"{type(e).__name__}: {e}"
+        print(f"[face_recognition import error] {_fr_error}", flush=True)
         return None, None
 
 def require_dbx():
@@ -452,7 +458,7 @@ async function loadStatus(){
 
     if(!d.fr_installed){
       dot.className='dot r';
-      txt.innerHTML='<strong>face_recognition not installed.</strong> Check Railway environment.';
+      txt.innerHTML='<strong>face_recognition error:</strong> ' + (d.fr_error || 'unknown — check Railway Deploy Logs');
       return;
     }
 
@@ -687,6 +693,7 @@ def api_status():
             indexed = len(pickle.load(fh))
     return jsonify({
         'fr_installed':       fr is not None,
+        'fr_error':           _fr_error,
         'dropbox_configured': bool(DROPBOX_TOKEN),
         'local_photos':       local_photos,
         'indexed':            indexed,
